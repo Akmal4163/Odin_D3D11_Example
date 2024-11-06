@@ -1,9 +1,10 @@
-package index_buffer
+package tex_color
 
 import d3d11"vendor:directx/d3d11"
 import dxgi"vendor:directx/dxgi"
 import dxc"vendor:directx/d3d_compiler"
 import win32"core:sys/windows"
+import stbi"vendor:stb/image"
 import glm"core:math/linalg/glsl"
 import "core:os"
 import "base:intrinsics"
@@ -20,41 +21,54 @@ pixel_shader: ^d3d11.IPixelShader
 input_layout: ^d3d11.IInputLayout
 vertex_buffer: ^d3d11.IBuffer
 index_buffer: ^d3d11.IBuffer
+color_buffer: ^d3d11.IBuffer
+sampler_state: ^d3d11.ISamplerState
 
+////////////////////////////
+texture1: ^d3d11.ITexture2D
+texture_view1: ^d3d11.IShaderResourceView
 
 vertex :: struct {
     pos: glm.vec3,
     col: glm.vec4,
+    texCoord: glm.vec2,
 }
 
 vertex_shader_source := `
 struct Input {
     float3 position : POSITION;
+    float2 texCoord : TEXCOORD;
     float4 color : COLOR;
 };
 
 struct Output {
     float4 position : SV_POSITION;
+    float2 TexCoord : TEXCOORD;
     float4 color : COLOR;
 };
 
 Output vs_main(Input input) {
     Output output;
-    output.position = float4(input.position.x, input.position.y, input.position.z, 1);
+    output.position = float4(input.position, 1);
+    output.TexCoord = input.texCoord;
     output.color = input.color;
-
     return output;
 }
 `
 
 pixel_shader_source := `
+Texture2D texture1 : register(t0);
+SamplerState sampleType : register(s0);
+
 struct Input {
     float4 position : SV_POSITION;
+    float2 texCoord : TEXCOORD;
     float4 color : COLOR;
 };
 
 float4 ps_main(Input input) : SV_TARGET {
-    return float4(input.color.r, input.color.g, input.color.b, input.color.a);
+    float4 tex1 = texture1.Sample(sampleType, input.texCoord);
+    return lerp(tex1, input.color, 0.5);
 }
 `
 
@@ -114,10 +128,10 @@ create_vertex_and_index_buffers :: proc () {
 
     {
         vertices : []vertex = {
-            {{-0.5, 0.5, 0.0}, {1.0, 0.0, 0.0, 0.0}}, 
-            {{0.5,  0.5,  0.0}, {0.0, 1.0, 0.0, 0.0}},
-            {{0.5, -0.5,  0.0}, {0.0, 0.0, 1.0, 0.0}},
-            {{-0.5, -0.5, -0.0}, {0.5, 0.5, 0.5, 0.5}}
+            {{0.5, 0.5, 0.0}, {1.0, 0.0, 0.0, 0.0}, {1.0, 1.0}},
+            {{0.5,  -0.5,  0.0}, {0.0, 1.0, 0.0, 0.0}, {1.0, 0.0}},
+            {{-0.5, -0.5,  0.0}, {0.0, 0.0, 1.0, 0.0}, {0.0, 0.0}},
+            {{-0.5, 0.5, 0.0},  {0.5, 0.5, 0.5, 0.5}, {0.0, 1.0}}
         }
 
         //vertex buffer
@@ -147,22 +161,50 @@ create_vertex_and_index_buffers :: proc () {
 
         device->CreateBuffer(&index_buffer_desc, &index_buffer_data, &index_buffer)
     }
-    
+
 }
 
-draw_frame :: proc () {
-    device_context->IASetInputLayout(input_layout)
-    device_context->VSSetShader(vertex_shader, nil, 0)
-    device_context->PSSetShader(pixel_shader, nil, 0)
-    stride := u32(size_of(vertex))
-    offset := u32(0)
-    device_context->IASetVertexBuffers(0, 1, &vertex_buffer, &stride, &offset)
-    device_context->IASetIndexBuffer(index_buffer, .R32_UINT, 0)
-    device_context->IASetPrimitiveTopology(.TRIANGLELIST)
-    device_context->DrawIndexed(6, 0, 0)
+prepare_texture :: proc () {
+    
+    {
+        //load texture using stb image
+        width, height, nr_channels: i32
+        image_data := stbi.load("textures/container.jpg", &width, &height, &nr_channels, 4)
+        assert(image_data != nil)
+
+        texture_desc: d3d11.TEXTURE2D_DESC
+        texture_desc.Width = u32(width)
+        texture_desc.Height = u32(height)
+        texture_desc.MipLevels = 1
+        texture_desc.ArraySize = 1
+        texture_desc.Format = .R8G8B8A8_UNORM
+        texture_desc.SampleDesc.Count = 1
+        texture_desc.Usage = .DEFAULT
+        texture_desc.BindFlags ={.SHADER_RESOURCE}
+
+        texture_data: d3d11.SUBRESOURCE_DATA
+        texture_data.pSysMem = &image_data[0]
+        texture_data.SysMemPitch = u32(width * 4)
+        device->CreateTexture2D(&texture_desc, &texture_data, &texture1)
+        
+        //create shader resource view
+        device->CreateShaderResourceView(texture1, nil, &texture_view1)
+        
+        //create sampler state
+        sampler_desc: d3d11.SAMPLER_DESC
+        sampler_desc.Filter = .MIN_MAG_MIP_LINEAR
+        sampler_desc.AddressU = .WRAP
+        sampler_desc.AddressV = .WRAP
+        sampler_desc.AddressW = .WRAP
+
+        device->CreateSamplerState(&sampler_desc, &sampler_state)
+        stbi.image_free(image_data)
+    }
+
 }
 
 compile_shader_from_source :: proc () {
+
     vs_blob: ^d3d11.IBlob; defer vs_blob->Release()
     dxc.Compile(raw_data(vertex_shader_source), len(vertex_shader_source), nil, nil, nil, "vs_main", "vs_5_0", 0, 0, &vs_blob, nil)
     assert(vs_blob != nil)
@@ -176,18 +218,37 @@ compile_shader_from_source :: proc () {
     layout := [?]d3d11.INPUT_ELEMENT_DESC {
         { "POSITION", 0, .R32G32B32_FLOAT, 0, 0, .VERTEX_DATA, 0 },
         { "COLOR", 0, .R32G32B32A32_FLOAT, 0, d3d11.APPEND_ALIGNED_ELEMENT, .VERTEX_DATA, 0 },
+        { "TEXCOORD", 0, .R32G32_FLOAT, 0, 0, .VERTEX_DATA, 0},
+
     }
 
     device->CreateInputLayout(&layout[0], len(layout), vs_blob->GetBufferPointer(), vs_blob->GetBufferSize(), &input_layout)
 }
 
-update :: proc () {
-
-    device_context->OMSetRenderTargets(1, &render_target_view, nil)
+draw_frame :: proc () {
     viewport := d3d11.VIEWPORT{
         0, 0, 800, 600, 0, 0
     }
+    stride := u32(size_of(vertex))
+    offset := u32(0)
+    device_context->IASetInputLayout(input_layout)
+    device_context->IASetVertexBuffers(0, 1, &vertex_buffer, &stride, &offset)
+    device_context->IASetIndexBuffer(index_buffer, .R32_UINT, 0)
+    device_context->IASetPrimitiveTopology(.TRIANGLELIST)
+    device_context->VSSetShader(vertex_shader, nil, 0)
+    device_context->PSSetShader(pixel_shader, nil, 0)
+
+    ///////////////////////////////////
+    device_context->PSSetShaderResources(0, 1, &texture_view1)
+    ///////////////////////////////////
+    device_context->PSSetSamplers(0, 1, &sampler_state)
+    device_context->OMSetRenderTargets(1, &render_target_view, nil)
+    device_context->OMSetBlendState(nil, nil, ~u32(0))
     device_context->RSSetViewports(1, &viewport)
+    device_context->DrawIndexed(6, 0, 0)
+}
+
+update :: proc () {
     clear_color := [4]f32{0.0, 0.0, 0.0, 1.0}
     device_context->ClearRenderTargetView(render_target_view, &clear_color)
 
@@ -208,8 +269,9 @@ mainloop :: proc () -> int {
 
     init_d3d(hwnd)
     create_vertex_and_index_buffers()
+    prepare_texture()
     compile_shader_from_source()
-
+    
     msg : win32.MSG
     for msg.message != win32.WM_QUIT {
         if(win32.PeekMessageW(&msg, nil, 0, 0, win32.PM_REMOVE)) {
@@ -235,6 +297,8 @@ cleanup :: proc () {
     if (swapchain != nil) { swapchain->Release()}
     if (device_context != nil) { device_context->Release()}
     if (device != nil) { device->Release()}
+    if (texture1 != nil) { texture1->Release()}
+    if (texture_view1 != nil) { texture_view1->Release()}
 }
 
 main :: proc () {
